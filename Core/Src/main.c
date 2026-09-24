@@ -20,7 +20,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "adc.h"
-#include "dma.h"
 #include "i2c.h"
 #include "quadspi.h"
 #include "rtc.h"
@@ -31,7 +30,6 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "../../MahonyAHRS/MahonyAHRS.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -40,45 +38,12 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-// Режимы работы
-typedef enum {
-    CTRL_MODE_MANUAL = 0,      // ручной / Vector Pursuit (PID)
-    CTRL_MODE_MPPI = 1         // прямое управление от MPPI
-} ctrl_mode_t;
-
-// Структура для PID-режима
-struct PCA9685 { // Управление движением
-    float w_cmd;
-    float setpoint;
-    uint8_t stop;
-};
-
-// Структура для MPPI-режима
-struct MPPI_Ctrl {
-    float steer_angle;   // рад
-    float throttle;      // -1..1
-    float brake;         // 0..1
-};
-
-struct Telem // Управление движением
-{
- // Команды
- float w_yaw;
- float stering_angle;
- float velosity_1d_mps;
-};
-
 typedef struct
 {
   int16_t velocity;
   uint32_t last_counter_value;
 }encoder_instance;
 
-typedef struct {
-    float gx_bias;  // rad/s
-    float gy_bias;
-    float gz_bias;
-} gyro_bias_t;
 
 /* USER CODE END PTD */
 
@@ -108,50 +73,36 @@ typedef struct {
 
 // ================================ PID Коэффициенты Мотора ================================ //
 
-#define kp_m 5.0f
-#define kd_m 10.0f
-#define ki_m 0.00001f    // Интегральный коэффициент
-#define deriv_threshold_speed 0.25f
+#define KP_SPEED_MOTOR  5.0f
+#define KD_SPEED_MOTOR  10.0f
+#define KI_SPEED_MOTOR  0.00001f
+#define DERIV_THRESH_MOTOR   0.25f
 
 // Ограничения интеграла (защита от переполнения и накопления)
-#define INTEGRAL_LIMIT_MOTOR   1000000000.0f    // Максимальное накопление интеграла (вперёд)
-#define INTEGRAL_LIMIT_MOTOR_NEG -1000000000.0f // Минимальное накопление интеграла (назад)
+#define INTEGRAL_LIMIT_MOTOR       4.095e8f
+#define INTEGRAL_LIMIT_MOTOR_NEG  -4.095e8f
 
-#define INTEGRAL_LIMIT_BRAKE   1000000000.0f      // Максимальное накопление интеграла тормоза
-#define INTEGRAL_LIMIT_BRAKE_NEG 0.0f             // Тормоз только вперёд (не накапливаем отрицательный)
+#define INTEGRAL_LIMIT_BRAKE       4.095e8f
+#define INTEGRAL_LIMIT_BRAKE_NEG   0.0f
 
-#define kp_b 1.0f
-#define kd_b 2.0f
-#define ki_b 0.00000001f
-#define deriv_threshold_brake 0.25f
+#define KP_SPEED_BRAKE 1.0f
+#define KD_SPEED_BRAKE 1.0f
+#define KI_SPEED_BRAKE 0.00000001f
+#define DERIV_THRESH_BRAKE 0.25f
 
-// Пределы для двигателя (PCA9685_SetPin ожидает 0-4095)
 #define MOTOR_PWM_MAX  4095
-#define MOTOR_PWM_MIN  -4095
 
-// Пределы для сервопривода (PCA9685_SetServoAngle ожидает 0-180 градусов)
-#define SERVO_ANGLE_MAX  180
-#define SERVO_ANGLE_MIN  0
-
-// ================================ Feed Forward (упреждение) ================================ //
-
-// Коэффициент feed forward (помогает быстрее реагировать на задание скорости)
-#define FF_GAIN_MOTOR   0.5f    // 0.5 = 50% упреждения
+#define SERVO_ANGLE_MAX  125
 
 // ============================================================
-// ПАРАМЕТРЫ РЕГУЛЯТОРА УГЛОВОЙ СКОРОСТИ
+// ПАРАМЕТРЫ РЕГУЛЯТОРА УГЛОВОЙ СКОРОСТ�?
 // ============================================================
-
-// Параметры PID
-#define YAW_KP 0.1f                       // Пропорциональный коэффициент
-#define YAW_KI 0.005f                    // Интегральный коэффициент
-#define YAW_KD 0.05f                    // Дифференциальный коэффициент
 
 // Геометрия
-#define WHEELBASE 0.46f   // Колёсная база [м]
+#define WHEELBASE 0.70f   // Колёсная база [м]
 
 // Ограничения
-#define MAX_STEER_ANGLE 0.523599f    // Макс. угол сервы [рад] (~30 градусов ранее был 20)
+#define MAX_STEER_ANGLE 0.471239    // Макс. угол сервы [рад] (~30 градусов ранее был 20)
 #define max_centrifugal 4.0f      // макс. допустимое боковое ускорение (м/с²) ≈0.4g
 #define safe_max_coff   1.25f     // Буфер для ограничения угла поврота колеса по центробежной силе
 
@@ -164,6 +115,7 @@ typedef struct {
 
 // Коэффициент: тики → метры
 #define TICKS_TO_METERS         (WHEEL_CIRCUMFERENCE / (ENCODER_TICKS_PER_REV * GEAR_RATIO))
+#define TICKS_PER_METER         (ENCODER_TICKS_PER_REV * GEAR_RATIO / WHEEL_CIRCUMFERENCE)
 
 // ============================================================
 // ПАРАМЕТРЫ HEARTBEAT (контроль связи с Mini-PC)
@@ -171,15 +123,6 @@ typedef struct {
 
 #define HEARTBEAT_TIMEOUT_MS     500     // Таймаут связи (мс)
 #define HEARTBEAT_COUNTER_MAX     10     // Максимум пропущенных пакетов
-
-#define YAW_RATE_CUTOFF_FREQ 2.0f
-
-//#define GYRO_CUTOFF_FREQ 0.00692f
-//#define ACCEL_CUTOFF_FREQ 0.00692f
-// Раньше был 0.00692 для 9кГц, теперь для 1125Гц при той же инерции:
-#define GYRO_CUTOFF_FREQ 0.0543f
-#define ACCEL_CUTOFF_FREQ 0.0543f
-#define YAW_RATE_ALPHA 0.234f
 
 /* USER CODE END PD */
 
@@ -193,7 +136,32 @@ typedef struct {
 /* USER CODE BEGIN PV */
 
   float vFilt;
-  float vPrev;
+
+  float vFilt_stage1 = 0.0f;
+
+  float alpha = 0.118f;   // fc ≈ 2 Гц, fs = 100 Гц
+
+  arm_biquad_cascade_df2T_instance_f32 S_velocity_lpf;
+  float32_t velocity_lpf_state[2] = {0};   // 2 состояния на 1 секцию
+
+  arm_biquad_cascade_df2T_instance_f32 S_steer_lpf;
+  float32_t steer_lpf_state[2] = {0};
+
+  const float32_t lpf_coeffs[5] = {
+       0.0009448f,   // b0
+       0.0018896f,   // b1
+       0.0009448f,   // b2
+       1.93404f,     // -a1
+      -0.93784f      // -a2
+  };
+
+  const float32_t steer_lpf_coeffs[5] = {
+       0.06745f,    // b0
+       0.13490f,    // b1
+       0.06745f,    // b2
+       1.14290f,    // -a1
+      -0.41279f     // -a2
+  };
 
   float velosity;
   float servo_angle_deg;
@@ -204,78 +172,15 @@ typedef struct {
   uint8_t heartbeat_fail_counter;  // Счётчик пропущенных heartbeat
   uint8_t connection_lost;         // Флаг потери связи
 
-  float integral_error;
-  float prev_error;
-  float prev_target_steer;
-
-  int16_t AccData[3];
-  int16_t GyroData[3];
-  int16_t Mag[3];
-
-  float roll, pitch, yaw;
-
-  float prev_yaw_rad;
-
-   axises gyro;
-   axises accel;
-   axises accel_Mahony;
-
-   // Структуры фильтров для 3-х осей
-   arm_biquad_casd_df1_inst_f32 S_gyroX, S_gyroY, S_gyroZ;
-
-   // Буферы состояний (для каждого фильтра 2-го порядка нужно 4 float)
-   float32_t gyroX_state[4];
-   float32_t gyroY_state[4];
-   float32_t gyroZ_state[4];
-
-   // �?спользуем атрибут секции .dtcm_data (проверь свой linker script, обычно он так называется)
-   __attribute__((section(".dtcm_data"))) float accX_buffer[5] = {0};
-   __attribute__((section(".dtcm_data"))) float accY_buffer[5] = {0};
-   __attribute__((section(".dtcm_data"))) float accZ_buffer[5] = {0};
-
-   float gx_filt = 0, gy_filt = 0, gz_filt = 0;
-   float ax_filt = 0, ay_filt = 0, az_filt = 0;
-   float yaw_rate_filtered = 0.0f;
-   uint8_t yaw_filter_initialized = 0;
-
-   // LPF 10Hz при частоте дискретизации 9000Hz, Q=0.707
-   // Формат CMSIS: {b0, b1, b2, a1, a2}
-   // (a1 и a2 инвертированы)
-   //float32_t gyro_biquad_coeffs[5] = {
-   //    0.00001215f, 0.00002431f, 0.00001215f, // b0, b1, b2
-   //    1.99011385f, -0.99016247f               // -a1, -a2
-   //};
-
-   // LPF 10Hz при частоте дискретизации 1125Hz, Q=0.707
-   // Формат CMSIS: {b0, b1, b2, a1, a2}
-   // (a1 и a2 инвертированы для arm_biquad_cascade_df1_f32)
-   float32_t gyro_biquad_coeffs[5] = {
-       0.000756f, 0.001512f, 0.000756f, // b0, b1, b2
-       1.920810f, -0.923835f            // -a1, -a2
-   };
-
-  // Размер 32 идеально совпадает с размером кэш-линии H7
-  uint8_t imu_dma_tx[32] __attribute__((section(".ARM.__at_0x24000000"))) __attribute__((aligned(32)));
-  uint8_t imu_dma_rx[32] __attribute__((section(".ARM.__at_0x24000000"))) __attribute__((aligned(32)));
-
   float k;
   float filVal;
 
-  float sum;
-  uint16_t sumcount;
-
-  float sum_M;
-  uint16_t sumcount_M;
-
-  uint32_t lastUpdate_check;
   uint32_t lastUpdate; // used to calculate integration interval
+  uint32_t lastUpdate_check;
   uint32_t lastUpdate_encoder;
-  uint32_t lastUpdate_icm20948;
   uint32_t Now;                         // used to calculate integration interval
 
   uint32_t deltaTime;
-
-  float deltaT;
 
   float last_Integral_Motor;
   float last_Integral_Brake;
@@ -294,29 +199,41 @@ typedef struct {
    // data array to be read
    uint8_t rx_data[NRF24L01P_PAYLOAD_LENGTH] = {0};
 
-   uint8_t UART4_BUFFER [256] = {0};
-   uint8_t UART5_BUFFER [256] = {0};
+   uint8_t UART4_BUFFER [PKT_MAX_PAYLOAD + 5] = {0};
+   uint8_t UART5_BUFFER [PKT_MAX_PAYLOAD + 5] = {0};
 
    volatile ctrl_mode_t current_mode = CTRL_MODE_MANUAL;
-   struct PCA9685 pca9685;
-   struct MPPI_Ctrl mppi_ctrl;
 
-   struct Telem telem;
+   Pkt_PCA_t  pca9685;
+   Pkt_MPI_t  mppi_ctrl;
+   Pkt_Tele_t telem;
 
    encoder_instance encoder;
 
-   //char buffer[10];
+   static pkt_rx_t rx_pkt;
 
-  #pragma pack(push, 1) // Гарантируем отсутствие "дырок" между float в структуре
-  typedef struct {
-    uint8_t header[4];      // "TELE"
-    float w_yaw;            // 4 байта
-    float stering_angle;    // 4 байта
-    float velosity_1d_mps;  // 4 байта
-  } TelePacket;
-  #pragma pack(pop)
+   /* ============ RX ============ */
+   volatile uint8_t  uart4_rx_buf[2][UART4_RX_BUF_SIZE];
+   volatile uint8_t  uart4_rx_active = 0;
+   volatile uint16_t uart4_rx_idx = 0;
 
-  TelePacket tele_out = {.header = {'T', 'E', 'L', 'E'}}; // Заголовок ставим один раз
+   volatile uint8_t  uart4_pkt_queue[UART4_PKT_QUEUE_SIZE][UART4_RX_BUF_SIZE];
+   volatile uint16_t uart4_pkt_len_queue[UART4_PKT_QUEUE_SIZE];
+   volatile uint8_t  uart4_pkt_head = 0;
+   volatile uint8_t  uart4_pkt_tail = 0;
+   volatile uint32_t uart4_pkt_dropped = 0;
+
+   volatile uint32_t uart4_total_bytes = 0;
+   volatile uint32_t uart4_total_packets = 0;
+
+   /* ============ TX ============ */
+   volatile uint8_t  uart4_tx_buf[UART4_TX_BUF_SIZE];
+   volatile uint16_t uart4_tx_head = 0;
+   volatile uint16_t uart4_tx_tail = 0;
+   volatile uint8_t  uart4_tx_busy = 0;
+
+   volatile uint32_t uart4_tx_total_bytes = 0;
+   volatile uint32_t uart4_tx_overflow = 0;
 
 /* USER CODE END PV */
 
@@ -328,13 +245,6 @@ void SystemClock_Config(void);
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin);
 
 /* USER CODE END PFP */
-
-void set_servo_angle_tim5(float angle_deg);
-void send_mode_ack(ctrl_mode_t mode);
-void reset_controllers(void);
-float getSafeMaxSteer(float v_fwd);
-float compute_target_steer(float w_des, float v_current);
-float yaw_rate_controller(float dt);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
@@ -452,16 +362,8 @@ char * ftoa(double f, char * buf, int precision)
 /**
  * @brief Сброс регулятора
  */
-void reset_yaw_controller(void)
-{
-    integral_error = 0.0f;
-    prev_error = 0.0f;
-    prev_target_steer = 0.0f;
-}
 
 void reset_controllers(void) {
-    integral_error = 0.0f;
-    prev_error = 0.0f;
     last_Integral_Motor = 0.0f;
     last_Integral_Brake = 0.0f;
     Last_Error_Motor = 0.0f;
@@ -469,18 +371,40 @@ void reset_controllers(void) {
 
     // Возврат сервы в центр
     servo_angle_deg = 90.0f;
-    set_servo_angle_tim5(servo_angle_deg);
 
     // Остановка мотора
     Output_Motor = 0;
     Output_Brake = 0;
 }
 
-// Подтверждение режима
+/**
+ * @brief  Неблокирующая отправка через UART4.
+ *         Кладёт байты в кольцевой буфер и запускает прерывание TXE.
+ * @param  data  указатель на данные
+ * @param  len   длина
+ * @retval 1 — всё уложено в буфер, 0 — не хватило места
+ */
+uint8_t uart4_send(const uint8_t *data, uint16_t len)
+{
+    for (uint16_t i = 0; i < len; i++) {
+        uint16_t next = (uart4_tx_head + 1) % UART4_TX_BUF_SIZE;
+        if (next == uart4_tx_tail) {
+            // буфер полон — пакет не влез
+            uart4_tx_overflow++;
+            return 0;
+        }
+        uart4_tx_buf[uart4_tx_head] = data[i];
+        uart4_tx_head = next;
+    }
 
-void send_mode_ack(ctrl_mode_t mode) {
-    uint8_t ack[5] = {'M','O','D','E', (uint8_t)mode};
-    HAL_UART_Transmit_DMA(&huart4, ack, 5);
+    // Если передача не идёт — запускаем её, включив прерывание TXE
+    if (!uart4_tx_busy) {
+        uart4_tx_busy = 1;
+        __HAL_UART_ENABLE_IT(&huart4, UART_IT_TXE);
+    }
+
+    uart4_tx_total_bytes += len;
+    return 1;
 }
 
 /**
@@ -524,13 +448,9 @@ void check_connection(void)
     {
         // Связь есть — сбрасываем счётчик
         heartbeat_fail_counter = 0;
-    }
-}
 
-void init_gyro_filters(void) {
-    arm_biquad_cascade_df1_init_f32(&S_gyroX, 1, gyro_biquad_coeffs, gyroX_state);
-    arm_biquad_cascade_df1_init_f32(&S_gyroY, 1, gyro_biquad_coeffs, gyroY_state);
-    arm_biquad_cascade_df1_init_f32(&S_gyroZ, 1, gyro_biquad_coeffs, gyroZ_state);
+        connection_lost = 0;
+    }
 }
 
 /**
@@ -548,16 +468,19 @@ float read_steering_angle(void)
     }
     HAL_ADC_Stop(&hadc3);
 
-    // 2. Масштабирование (Map) из сырых данных в градусы
-    // Формула: (val - min) * range / (max - min)
-    float raw_angle = (float)(adc_value - STEER_ADC_MIN) * STEER_RANGE_DEG / (float)(STEER_ADC_MAX - STEER_ADC_MIN);
+    // 2. Масштабирование в градусы
+    float raw_angle = (float)(adc_value - STEER_ADC_MIN) * STEER_RANGE_DEG
+                    / (float)(STEER_ADC_MAX - STEER_ADC_MIN);
 
-    // 3. Ограничение (Clamp), чтобы не вылетало за границы при шумах
+    // 3. Clamp — защита от вылета за границы
     if (raw_angle < 0.0f) raw_angle = 0.0f;
     if (raw_angle > STEER_RANGE_DEG) raw_angle = STEER_RANGE_DEG;
 
-    // 4. Цифровая фильтрация (EMA фильтр) для стабильности показаний
-    filtered_angle = (raw_angle * STEER_FILTER_K) + (filtered_angle * (1.0f - STEER_FILTER_K));
+    // 4. Биквад Баттерворта 2-го порядка, fc = 10 Гц
+    float32_t angle_in = raw_angle;
+    float32_t angle_out;
+    arm_biquad_cascade_df2T_f32(&S_steer_lpf, &angle_in, &angle_out, 1);
+    filtered_angle = angle_out;
 
     return filtered_angle;
 }
@@ -620,117 +543,6 @@ static inline float clamp(float val, float min_val, float max_val)
     return val;
 }
 
-/**
- * @brief Получить отфильтрованную угловую скорость рыскания из MahonyAHRS
- * Возвращает угловую скорость в стабилизированной системе координат (earth frame)
- */
-float get_filtered_yaw_rate(void)
-{
-
-    // Получаем сырую угловую скорость
-    float yaw_rate_raw = MahonyAHRSgetStabilizedYawRateRad( //Down
-    		  gx_filt * DEGTORAD,
-			  gy_filt * DEGTORAD,
-			 -gz_filt * DEGTORAD
-    );
-
-    // �?нициализация при первом вызове
-    if (!yaw_filter_initialized) {
-        yaw_rate_filtered = yaw_rate_raw;
-        yaw_filter_initialized = 1;
-        return yaw_rate_raw;
-    }
-
-    // EMA фильтр: output = alpha * input + (1 - alpha) * previous_output
-    yaw_rate_filtered = YAW_RATE_ALPHA * yaw_rate_raw + (1.0f - YAW_RATE_ALPHA) * yaw_rate_filtered;
-
-    return yaw_rate_filtered;
-}
-/**
- * @brief Вычисление желаемого угла сервы из желаемой угловой скорости
- */
-float compute_target_steer(float w_des, float v_current)
-{
-    float abs_v = fabsf(v_current);
-
-    if (abs_v < 0.1f) {
-        return 0.0f;  // На малой скорости не рулим
-    }
-
-    float v_for_kin = abs_v;
-    float target = atan2f(w_des * WHEELBASE, v_for_kin);
-
-    if (v_current < 0.0f) {
-        target = -target;  // инвертируем при заднем ходе
-    }
-
-    return target;
-}
-
-/**
- * @brief Регулятор угловой скорости (вызывать с частотой 50-100 Гц)
- * @param dt Время с предыдущего вызова (сек)
- */
-float yaw_rate_controller(float dt)
-{
-    if (dt <= 0.0f || dt > 0.1f) dt = 0.005f;
-
-    // Динамическое ограничение
-    float safe_max = getSafeMaxSteer(telem.velosity_1d_mps);
-    float safe_max_angle = safe_max * safe_max_coff;
-
-    // 1. Получить текущую угловую скорость (уже в earth frame)
-    telem.w_yaw = get_filtered_yaw_rate();
-
-    // 2. Ошибка (с учётом знака скорости)
-    float error = pca9685.w_cmd - telem.w_yaw;
-    if (telem.velosity_1d_mps < 0.0f) {
-        error = -error;
-    }
-
-    // 3. Feed-forward из кинематики
-    float ff = compute_target_steer(pca9685.w_cmd, telem.velosity_1d_mps);
-    ff = clamp(ff, -safe_max_angle, safe_max_angle);
-
-    // 4. Пропорциональная составляющая
-    float P = YAW_KP * error;
-
-    // 5. Интегральная составляющая с I-term relax
-    integral_error += error * dt;
-
-    // I-term relax: затухание при вращении
-    if (fabsf(telem.w_yaw) > 1.0f) {
-        integral_error *= 0.9f;
-    }
-
-    // Полный сброс при нулевой уставке и малой скорости
-    if (fabsf(pca9685.w_cmd) < 0.001f && fabsf(telem.w_yaw) < 0.05f) {
-        integral_error = 0.0f;
-    }
-
-    // Ограничение интеграла
-    integral_error = clamp(integral_error, -MAX_STEER_ANGLE, MAX_STEER_ANGLE);
-    float I = YAW_KI * integral_error;
-
-    // 6. Дифференциальная составляющая
-    float D = YAW_KD * (error - prev_error) / dt;
-    prev_error = error;
-
-    // 7. Суммарный целевой угол
-    float target_steer = ff + (P + I + D);
-    target_steer = clamp(target_steer, -safe_max_angle, safe_max_angle);
-
-    // 8. Anti-windup: если выход насыщен и ошибка тянет дальше — не накапливать интеграл
-    if ((target_steer >= safe_max && error > 0.0f) ||
-        (target_steer <= -safe_max && error < 0.0f)) {
-        integral_error = clamp(integral_error, -MAX_STEER_ANGLE, MAX_STEER_ANGLE);
-        // Можно оставить интеграл как есть или слегка затушить
-        integral_error *= 0.95f;
-    }
-
-    return target_steer;
-}
-
 float calculate (float A2, float B2, float C2) {
     uint8_t A2_gt_B2 = (A2 > B2) ? 1 : 0;
     uint8_t C2_gt_A2 = (C2 - A2 > 0) ? 1 : 0;
@@ -753,61 +565,74 @@ float expRunningAverage(float newVal) {
   return filVal;
 }
 
-// Вторым аргументом передаем указатель на массив из 5 элементов (float buffer[5])
-float process_median5(float newValue, float* buf) {
-    // 1. Сдвигаем буфер (на H7 это мгновенно)
-    buf[0] = buf[1];
-    buf[1] = buf[2];
-    buf[2] = buf[3];
-    buf[3] = buf[4];
-    buf[4] = newValue;
-
-    // 2. Копируем во временные переменные, чтобы компилятор
-    // положил их в быстрые регистры процессора
-    float a = buf[0];
-    float b = buf[1];
-    float c = buf[2];
-    float d = buf[3];
-    float e = buf[4];
-    float t;
-
-    // 3. Та самая сеть сортировки (9 операций fminf/fmaxf)
-    t = a; a = fminf(a, b); b = fmaxf(t, b);
-    t = c; c = fminf(c, d); d = fmaxf(t, d);
-    t = a; a = fminf(a, c); c = fmaxf(t, c);
-    t = b; b = fminf(b, d); d = fmaxf(t, d);
-    t = a; a = fminf(a, e); e = fmaxf(t, e);
-    t = b; b = fminf(b, c); c = fmaxf(t, c);
-    t = d; d = fminf(d, e); e = fmaxf(t, e);
-    t = b; b = fminf(b, d); d = fmaxf(t, d);
-    t = c; c = fminf(c, d); d = fmaxf(t, d);
-
-    return c; // Медиана
-}
-
-// Loop 1 Hz
-void update_lidar_gprmc(void)
+void uart(void)
 {
-    static uint32_t fake_time = 120000;
-    static char packet[80];
+    while (uart4_pkt_tail != uart4_pkt_head) {
+        uint16_t len = uart4_pkt_len_queue[uart4_pkt_tail];
+        for (uint16_t i = 0; i < len; i++) {
+            if (pkt_rx_feed(&rx_pkt, uart4_pkt_queue[uart4_pkt_tail][i])) {
+                switch (rx_pkt.cmd) {
+                    case PKT_CMD_PCA:
+                        if (rx_pkt.len == sizeof(Pkt_PCA_t) &&
+                            current_mode == CTRL_MODE_MANUAL) {
+                            Pkt_PCA_t *p = (Pkt_PCA_t*)rx_pkt.payload;
+                            pca9685.w_cmd    = p->w_cmd;
+                            pca9685.setpoint = p->setpoint;
+                            pca9685.stop     = p->stop;
+                            flag_pca9685 = 1;
+                            last_rx_time = HAL_GetTick();
+                            heartbeat_fail_counter = 0;
+                            connection_lost = 0;
+                        }
+                        break;
 
-    fake_time++;
-    if (fake_time % 100 >= 60) fake_time += 40;
-    if ((fake_time / 100) % 100 >= 60) fake_time += 4000;
+                    case PKT_CMD_MPI:
+                        if (rx_pkt.len == sizeof(Pkt_MPI_t) &&
+                            current_mode == CTRL_MODE_MPPI) {
+                            Pkt_MPI_t *p = (Pkt_MPI_t*)rx_pkt.payload;
+                            mppi_ctrl.steer_angle = p->steer_angle;
+                            mppi_ctrl.throttle    = p->throttle;
+                            mppi_ctrl.brake       = p->brake;
+                            flag_pca9685 = 1;
+                            last_rx_time = HAL_GetTick();
+                            heartbeat_fail_counter = 0;
+                            connection_lost = 0;
+                        }
+                        break;
 
-    // Собираем строку с $, телом и местом под чек-сумму
-    int len = sprintf(packet, "$GPRMC,%06lu.00,A,0000.0000,N,00000.0000,E,0.0,0.0,060826,,,A", fake_time);
+                    case PKT_CMD_MODE:
+                        if (rx_pkt.len >= 1) {
+                            ctrl_mode_t req = (rx_pkt.payload[0] == 1)
+                                            ? CTRL_MODE_MPPI : CTRL_MODE_MANUAL;
+                            if (req != current_mode) {
+                                current_mode = req;
+                                reset_controllers();
+                            }
+                            uint8_t ack_buf[8];
+                            uint8_t m = (uint8_t)current_mode;
+                            uint16_t n = pkt_build(ack_buf, PKT_CMD_MODE_ACK, &m, 1);
+                            if (!uart4_send(ack_buf, n)) {
+                                uart4_tx_overflow++;
+                            }
+                        }
+                        break;
 
-    // Считаем XOR по содержимому после $
-    uint8_t checksum = 0;
-    for (int i = 1; i < len; i++) checksum ^= packet[i];
+                    case PKT_CMD_PING: {
+                        uint8_t pong_buf[8];
+                        uint16_t n = pkt_build(pong_buf, PKT_CMD_PONG, NULL, 0);
+                        if (!uart4_send(pong_buf, n)) {
+                            uart4_tx_overflow++;
+                        }
+                        break;
+                    }
 
-    // Дописываем чек-сумму и \r\n
-    len += sprintf(packet + len, "*%02X\r\n", checksum);
-
-    // Одним вызовом
-    HAL_UART_Transmit_DMA(&huart2, (uint8_t*)packet, len);
-
+                    default:
+                        break;
+                }
+            }
+        }
+        uart4_pkt_tail = (uart4_pkt_tail + 1) % UART4_PKT_QUEUE_SIZE;
+    }
 }
 
 //Loop 100Hz
@@ -844,25 +669,18 @@ void update_encoder(void)
     encoder.last_counter_value = temp_counter;
     velosity = (float)-encoder.velocity;
 
-    // Low-pass filter (25 Hz cutoff)
-    vFilt = 0.854f * vFilt + 0.0728f * velosity + 0.0728f * vPrev;
-    vPrev = velosity;
+    float32_t v_in = velosity;
+    float32_t v_out;
+    arm_biquad_cascade_df2T_f32(&S_velocity_lpf, &v_in, &v_out, 1);
+    vFilt = v_out;
+
+    vFilt_stage1 = alpha * velosity + (1.0f - alpha) * vFilt_stage1;
+    vFilt = alpha * vFilt_stage1 + (1.0f - alpha) * vFilt;
 
     // ================================ Обновление скорости (м/с) ================================ //
     float deltaTime_sec = deltaTime / 1000000.0f;  // мкс → сек
+    float setpoint_ticks = pca9685.setpoint * TICKS_PER_METER * deltaTime_sec;
     telem.velosity_1d_mps = vFilt * TICKS_TO_METERS / deltaTime_sec;
-
-    // ================================ MAHONY =================================================== //
-
-       // gx, gy, gz уже в rad/s, ax, ay, az уже в m/s²
-       //MahonyAHRSupdateIMU(gx_filt * DEGTORAD, -gy_filt * DEGTORAD, -gz_filt * DEGTORAD, -accel_Mahony.x, accel_Mahony.y, accel_Mahony.z, deltaTM); //Up
-
-       MahonyAHRSupdateIMU(-gx_filt * DEGTORAD, gy_filt * DEGTORAD, -gz_filt * DEGTORAD, -accel_Mahony.x, -accel_Mahony.y, accel_Mahony.z, deltaTime_sec);  //Down
-
-       telem.w_yaw = get_filtered_yaw_rate();
-
-       sum_M += deltaTime_sec;
-       sumcount_M++;
 
        // ================================ РЕЖИМ MPPI ================================ //
         if (current_mode == CTRL_MODE_MPPI)
@@ -899,10 +717,41 @@ void update_encoder(void)
                return;  // ПИД-регуляторы не вызываем
     }
 
+        // ===== РЕГУЛЯТОР УГЛОВОЙ СКОРОСТИ =====
+
+        float safe_max = getSafeMaxSteer(telem.velosity_1d_mps);
+        float safe_max_angle = safe_max * safe_max_coff;
+
+        float abs_v = fabsf(telem.velosity_1d_mps);
+
+        float ads_s = fabsf(pca9685.setpoint);
+
+        if (abs_v > 0.1f) {
+
+           float blend = ads_s / 6.5f;
+
+           // Взвешенный знаменатель
+           float v_denom = (1.0f - blend) * ads_s + blend * abs_v;
+
+           float steer_rad = atan2f(pca9685.w_cmd * WHEELBASE, v_denom);
+
+           steer_rad = clamp(steer_rad, -safe_max_angle, safe_max_angle);
+
+           if (steer_rad >  MAX_STEER_ANGLE) steer_rad =  MAX_STEER_ANGLE;
+           if (steer_rad < -MAX_STEER_ANGLE) steer_rad = -MAX_STEER_ANGLE;
+
+           servo_angle_deg = 90.0f - steer_rad * RADTODEG;
+
+           if (servo_angle_deg > 120.0f) servo_angle_deg = 120.0f;
+           if (servo_angle_deg < 60.0f)  servo_angle_deg = 60.0f;
+
+        }
+
+       set_servo_angle_tim5(servo_angle_deg);
+
     // ================================ Ограничение скорости по кривизне ================================ //
     if (pca9685.setpoint >= 0.0f) {
-        float curvature = fabsf(pca9685.w_cmd) / fmaxf(fabsf(telem.velosity_1d_mps), 0.1f);
-        float safe_max = getSafeMaxSteer(telem.velosity_1d_mps);
+        float curvature = fabsf(pca9685.w_cmd) / fmaxf(abs_v, 0.1f);
         float min_radius = WHEELBASE / tanf(safe_max);
         float v_limited = pca9685.setpoint;
 
@@ -919,103 +768,39 @@ void update_encoder(void)
 
     // ================================ PID Control Motor ================================ //
 
-    float feed_forward_motor = pca9685.setpoint * FF_GAIN_MOTOR;
+    float Error_Motor = setpoint_ticks - vFilt;
 
-    float Error_Motor = pca9685.setpoint - vFilt;
-    float Error_Motor_ABS = fabsf(Error_Motor);
+    float Delta_Motor = (Error_Motor - Last_Error_Motor) / deltaTime; Last_Error_Motor = Error_Motor;
 
-    float Delta_Motor = (Error_Motor - Last_Error_Motor) / deltaTime;
-    Last_Error_Motor = Error_Motor;
+    if (Delta_Motor > DERIV_THRESH_MOTOR)  Delta_Motor -= DERIV_THRESH_MOTOR;
+    if (Delta_Motor < -DERIV_THRESH_MOTOR) Delta_Motor += DERIV_THRESH_MOTOR;
 
-    if (Delta_Motor > deriv_threshold_speed)  Delta_Motor -= deriv_threshold_speed;
-    if (Delta_Motor < -deriv_threshold_speed) Delta_Motor += deriv_threshold_speed;
+    float Integral_Motor = last_Integral_Motor + Error_Motor * deltaTime; last_Integral_Motor = Integral_Motor;
 
-    float Integral_Motor = 0.0f;
-
-    // I-Term Relax: накопление только при умеренной ошибке
-    if (Error_Motor_ABS > 0.5f && Error_Motor_ABS < 3.0f && fabsf(pca9685.setpoint) > 0.5f) {
-        Integral_Motor = last_Integral_Motor + Error_Motor * deltaTime;
-    } else {
-        last_Integral_Motor *= 0.9f;
-    }
-
-    // Сброс при смене знака уставки
-    static float prev_setpoint = 0.0f;
-    if ((pca9685.setpoint > 0.1f && prev_setpoint < -0.1f) ||
-        (pca9685.setpoint < -0.1f && prev_setpoint > 0.1f)) {
-        last_Integral_Motor = 0.0f;
-    }
-    prev_setpoint = pca9685.setpoint;
-
-    if (Integral_Motor > INTEGRAL_LIMIT_MOTOR) Integral_Motor = INTEGRAL_LIMIT_MOTOR;
+    if (Integral_Motor > INTEGRAL_LIMIT_MOTOR)  Integral_Motor = INTEGRAL_LIMIT_MOTOR;
     if (Integral_Motor < INTEGRAL_LIMIT_MOTOR_NEG) Integral_Motor = INTEGRAL_LIMIT_MOTOR_NEG;
 
-    last_Integral_Motor = Integral_Motor;
+    Output_Motor = (int16_t)(KP_SPEED_MOTOR * Error_Motor + KD_SPEED_MOTOR * Delta_Motor + KI_SPEED_MOTOR * Integral_Motor);
 
-    float pid_output_motor = kp_m * Error_Motor + Delta_Motor * kd_m + Integral_Motor * ki_m;
-    Output_Motor = (int16_t)(pid_output_motor + feed_forward_motor);
-
-    if (Output_Motor > MOTOR_PWM_MAX) Output_Motor = MOTOR_PWM_MAX;
-    if (Output_Motor < MOTOR_PWM_MIN) Output_Motor = MOTOR_PWM_MIN;
-
-    if (pca9685.setpoint == 0.0f) {
-        Output_Motor = 0;
-        last_Integral_Motor = 0.0f;
-        Integral_Motor = 0.0f;
-    }
-
-    if ((Output_Motor >= MOTOR_PWM_MAX && Error_Motor > 0) ||
-        (Output_Motor <= MOTOR_PWM_MIN && Error_Motor < 0)) {
-        last_Integral_Motor = Integral_Motor;
-    }
+    if (fabsf(pca9685.setpoint) < 1e-6f) { Output_Motor = 0; last_Integral_Motor = 0.0f; Integral_Motor = 0.0f; }
 
     // ================================ PID Control Brake ================================ //
 
-    float Error_Brake = expRunningAverage(calculate(pca9685.setpoint, vFilt, Error_Motor));
+    float Error_Brake = expRunningAverage(calculate(setpoint_ticks, vFilt, Error_Motor));
 
-    float Delta_Brake = (Error_Brake - Last_Error_Brake) / deltaTime;
-    Last_Error_Brake = Error_Brake;
+    float Delta_Brake = (Error_Brake - Last_Error_Brake) / deltaTime; Last_Error_Brake = Error_Brake;
 
-    if (Delta_Brake > deriv_threshold_brake) Delta_Brake -= deriv_threshold_brake;
-    if (Delta_Brake < -deriv_threshold_brake)  Delta_Brake += deriv_threshold_brake;
+    if (Delta_Brake > DERIV_THRESH_BRAKE) Delta_Brake -= DERIV_THRESH_BRAKE;
+    if (Delta_Brake < -DERIV_THRESH_BRAKE)  Delta_Brake += DERIV_THRESH_BRAKE;
 
-    float Integral_Brake = 0.0f;
+    float Integral_Brake = last_Integral_Brake + Error_Brake * deltaTime; last_Integral_Brake = Integral_Brake;
 
-    if (Error_Motor_ABS > 0.5f && Error_Motor_ABS < 3.0f) {
-        Integral_Brake = last_Integral_Brake + Error_Brake * deltaTime;
-    } else {
-        last_Integral_Brake *= 0.9f;
-    }
-
-    if (Integral_Brake > INTEGRAL_LIMIT_BRAKE) Integral_Brake = INTEGRAL_LIMIT_BRAKE;
+    if (Integral_Brake > INTEGRAL_LIMIT_BRAKE)  Integral_Brake = INTEGRAL_LIMIT_BRAKE;
     if (Integral_Brake < INTEGRAL_LIMIT_BRAKE_NEG) Integral_Brake = INTEGRAL_LIMIT_BRAKE_NEG;
 
-    last_Integral_Brake = Integral_Brake;
+    Output_Brake = (int16_t)(KP_SPEED_BRAKE * Error_Brake + Delta_Brake * KD_SPEED_BRAKE + Integral_Brake * KI_SPEED_BRAKE);
 
-    Output_Brake = (int16_t)(kp_b * Error_Brake + Delta_Brake * kd_b + Integral_Brake * ki_b);
-
-    if (Output_Brake > SERVO_ANGLE_MAX) Output_Brake = SERVO_ANGLE_MAX;
-    if (Output_Brake < SERVO_ANGLE_MIN) Output_Brake = SERVO_ANGLE_MIN;
-
-    if (Error_Brake < 1.0f) {
-        Output_Brake = 0;
-        last_Integral_Brake = 0.0f;
-        Integral_Brake = 0.0f;
-    }
-
-    if (Output_Brake >= SERVO_ANGLE_MAX && Error_Brake > 0.0f) {
-        last_Integral_Brake = Integral_Brake;
-    }
-
-    // ================================ угол сервы ================================ //
-
-    servo_angle_deg = yaw_rate_controller(deltaTime_sec) * RADTODEG;  // ±30°
-    servo_angle_deg = 90.0f + servo_angle_deg;  // 60-120°
-
-    if (servo_angle_deg > 120.0f) servo_angle_deg = 120.0f;
-    if (servo_angle_deg < 60.0f) servo_angle_deg = 60.0f;
-
-    set_servo_angle_tim5(servo_angle_deg);
+    if (Error_Brake < 1.0f) { Output_Brake = 0; last_Integral_Brake = 0.0f; Integral_Brake = 0.0f;}
 
     flag_pca9685 = 1;
 }
@@ -1024,66 +809,68 @@ void loop (void) {
 
 	Now = htim2.Instance->CNT;
 
-	 if((Now - lastUpdate_check) > 10000) {  lastUpdate_check = Now; // каждые 10 мс (100 Гц)
+	uart();
 
-	 check_connection();
+	if ((Now - lastUpdate_check) > 10000) { // каждые 10 мс (100 Гц)
 
-	 telem.stering_angle = (get_steering_angle_signed() - 90.0f) * Servo_to_wheel_ratio;
+		lastUpdate_check = Now;
 
-	 // Просто копируем значения (H7 сделает это мгновенно)
-	 tele_out.w_yaw = telem.w_yaw;
-	 tele_out.stering_angle = telem.stering_angle;
-	 tele_out.velosity_1d_mps = telem.velosity_1d_mps;
+		check_connection();
 
-	 // Отправляем весь пакет целиком (16 байт)
-	 // 4 байта заголовок + 12 байт данных = 16 (идеально для 32-битной шины)
-	 HAL_UART_Transmit_IT(&huart4, (uint8_t*)&tele_out, sizeof(TelePacket));
+	     telem.stering_angle = (get_steering_angle_signed() - 90.0f) * Servo_to_wheel_ratio;
 
-	}
+	     Pkt_Tele_t tel;
+	     tel.stering_angle = telem.stering_angle;
+	     tel.velosity_1d_mps = telem.velosity_1d_mps;
 
-     if((Now - lastUpdate) > 100000) {
-         lastUpdate = Now;
-         MahonyAHRSgetEuler(&roll, &pitch, &yaw);
+	     uint8_t buf[32];
+	     uint16_t n = pkt_build(buf, PKT_CMD_TELE, &tel, sizeof(tel));
+	     if (!uart4_send(buf, n)) {
+	         uart4_tx_overflow++;
+	     }
+	 }
 
-         char screen_lines[8][24];
-         char f_buf[16];
+	 if((Now - lastUpdate) > 100000) {
+	     char screen_lines[8][24];
+	     char f_buf[16];
 
-         // 0. СКОРОСТЬ
-         ftoa(telem.velosity_1d_mps, f_buf, 2);
-         sprintf(screen_lines[0], "Speed: %s m/s", f_buf);
+	     // 0. СКОРОСТЬ
+	     ftoa(telem.velosity_1d_mps, f_buf, 2);
+	     sprintf(screen_lines[0], "Speed: %s m/s", f_buf);
 
-         // 1. STEER
-         ftoa(telem.stering_angle, f_buf, 1);
-         sprintf(screen_lines[1], "SteerA: %s deg", f_buf);
+	     // 1. УГОЛ РУЛЯ
+	     ftoa(telem.stering_angle, f_buf, 1);
+	     sprintf(screen_lines[1], "SteerA: %s deg", f_buf);
 
-         // 2. SERVO & BRAKE (Объединили вывод управления)
-         ftoa(servo_angle_deg, f_buf, 1);
-         sprintf(screen_lines[2], "S:%s B:%d M:%s ", f_buf, Output_Brake, (current_mode == CTRL_MODE_MPPI) ? "1" : "2");
+	     // 2. СЕРВО + ТОРМОЗ + РЕЖ�?М
+	     ftoa(servo_angle_deg, f_buf, 1);
+	     sprintf(screen_lines[2], "S:%s B:%d M:%s", f_buf,
+	             Output_Brake, (current_mode == CTRL_MODE_MPPI) ? "1" : "2");
 
-         // 3. ROLL
-         sprintf(screen_lines[3], "Roll:  %.2f", roll);
+	     // 3. УСТАВК�? от miniPC (v и w)
+	     sprintf(screen_lines[3], "sp:%.2f/%.2f", pca9685.setpoint, pca9685.w_cmd);
 
-         // 4. PITCH
-         sprintf(screen_lines[4], "Pitch: %.2f", pitch);
+	     // 4. СВЯЗЬ (lost + heartbeat counter)
+	     sprintf(screen_lines[4], "L:%d hb:%d rx:%lu",
+	             connection_lost, heartbeat_fail_counter, last_rx_time);
 
-         // 5. YAW
-         sprintf(screen_lines[5], "Yaw:   %.2f", yaw);
+	     // 5. PID МОТОР (ошибка и выход) + период
+	     float sp_ticks_lcd = pca9685.setpoint * TICKS_PER_METER * (deltaTime / 1000000.0f);
+	     float error_lcd = sp_ticks_lcd - vFilt;
+	     ftoa(error_lcd, f_buf, 1);
+	     sprintf(screen_lines[5], "E:%s OM:%d dt:%lu",
+	             f_buf, Output_Motor, deltaTime);
 
-         // 6. YAW RATE (Сделал 3 знака после запятой)
-         ftoa(telem.w_yaw * RADTODEG, f_buf, 3);
-         sprintf(screen_lines[6], "W-Yaw: %s d/s", f_buf);
+	     // 6. ТОРМОЗ (угол) + скорость в тиках
+	     ftoa(vFilt, f_buf, 1);
+	     sprintf(screen_lines[6], "vF:%s Br:%d", f_buf, Output_Brake);
 
-         // 7. Считаем частоты
-         float Hz = (float)sumcount / (sum > 0 ? sum : 1);
-         sumcount = 0; sum = 0;
-         float Hz_M = (float)sumcount_M / (sum_M > 0 ? sum_M : 1);
-         sumcount_M = 0; sum_M = 0;
-         sprintf(screen_lines[7], "S/M: %.1f / %.1f", Hz, Hz_M);
+	     // 7. UART4 диагностика
+	     sprintf(screen_lines[7], "P%lu D%lu T%lu",
+	             uart4_total_packets, uart4_pkt_dropped, uart4_tx_total_bytes);
 
-         // --- ОТПРАВКА НА ЭКРАН (Асинхронно) ---
-         ST7735_PrintTelemetry_IT(screen_lines, Font_7x10, ST7735_GREEN, ST7735_BLACK);
-     }
-
+	     ST7735_PrintTelemetry_IT(screen_lines, Font_7x10, ST7735_GREEN, ST7735_BLACK);
+	 }
 
 	if(flag_nrf24l01) { flag_nrf24l01 = 0;
 
@@ -1118,7 +905,7 @@ void loop (void) {
 
 	    // Получаем абсолютное значение для PWM
 	    uint16_t pwm_abs = (Output_Motor > 0) ? Output_Motor : -Output_Motor;
-	    if(pwm_abs > 4095) pwm_abs = 4095;
+	    if(pwm_abs > MOTOR_PWM_MAX) pwm_abs = MOTOR_PWM_MAX;
 
 	    // Управление
 	    if(Output_Motor > 0 && vFilt > SAFE_SPEED_BACKWARD_CHANGE)
@@ -1142,7 +929,7 @@ void loop (void) {
 
 	    // Тормоз
 	    Output_ServoBrake = pca9685.stop + Output_Brake;
-	    if(Output_ServoBrake > 125) Output_ServoBrake = 125;
+	    if(Output_ServoBrake > SERVO_ANGLE_MAX) Output_ServoBrake = SERVO_ANGLE_MAX;
 	    if(Output_ServoBrake < 0) Output_ServoBrake = 0;
 	    PCA9685_SetServoAngle(1, Output_ServoBrake);
 
@@ -1160,13 +947,25 @@ int main(void)
 {
   /* USER CODE BEGIN 1 */
 
+  arm_biquad_cascade_df2T_init_f32(
+
+   &S_velocity_lpf,
+   1,                          // 1 секция = 2-й порядок
+   lpf_coeffs,
+   velocity_lpf_state
+
+  );
+
+  arm_biquad_cascade_df2T_init_f32(
+     &S_steer_lpf,
+     1,
+     steer_lpf_coeffs,
+     steer_lpf_state
+  );
+
   connection_lost = 0;
   heartbeat_fail_counter = 0;
   last_rx_time = 0;
-
-  integral_error = 0.0f;
-  prev_error = 0.0f;
-  prev_target_steer = 0.0f;
 
   Output_Motor = 0;
   Output_Brake = 0;
@@ -1182,10 +981,8 @@ int main(void)
   lastUpdate_check = 0;
 
   vFilt = 0.0f;
-  vPrev = 0.0f;
 
   velosity = 0.0f;
-  prev_yaw_rad = 0.0f;
 
   flag_encoder = 0;
 
@@ -1201,7 +998,6 @@ int main(void)
   servo_angle_deg = 90.0f;
   telem.velosity_1d_mps = 0.0f;
   telem.stering_angle = 0.0f;
-  telem.w_yaw = 0.0f;
 
   encoder.velocity = 0;
   encoder.last_counter_value = 32767;
@@ -1212,13 +1008,13 @@ int main(void)
   k = 0.01f;
   filVal = 0.0f;
 
-  gx_filt = 0.0f;
-  gy_filt = 0.0f;
-  gz_filt = 0.0f;
+  uart4_rx_idx = 0;
 
-  ax_filt = 0.0f;
-  ay_filt = 0.0f;
-  az_filt = 0.0f;
+  uart4_tx_head = 0;
+  uart4_tx_tail = 0;
+  uart4_tx_busy = 0;
+  uart4_tx_overflow = 0;
+  uart4_tx_total_bytes = 0;
 
   /* USER CODE END 1 */
 
@@ -1243,7 +1039,6 @@ int main(void)
   MX_SPI1_Init();
   MX_SPI4_Init();
   MX_SPI2_Init();
-  MX_DMA_Init();
   MX_UART4_Init();
   MX_UART5_Init();
   MX_TIM2_Init();
@@ -1253,10 +1048,8 @@ int main(void)
   MX_ADC3_Init();
   MX_TIM5_Init();
   MX_RTC_Init();
-  MX_SPI3_Init();
   MX_TIM1_Init();
   MX_TIM8_Init();
-  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE BEGIN 2 */
@@ -1278,19 +1071,16 @@ int main(void)
 
    HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3);
 
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart4, UART4_BUFFER, 256);
+   __HAL_UART_CLEAR_OREFLAG(&huart4);
+   __HAL_UART_CLEAR_FEFLAG(&huart4);
+   __HAL_UART_CLEAR_NEFLAG(&huart4);
+   __HAL_UART_CLEAR_PEFLAG(&huart4);
 
-  __HAL_DMA_DISABLE_IT(&hdma_uart4_rx, DMA_IT_HT);
+   __HAL_UART_ENABLE_IT(&huart4, UART_IT_RXNE);   // прерывание на байт
+   __HAL_UART_ENABLE_IT(&huart4, UART_IT_IDLE);   // прерывание на IDLE
+   __HAL_UART_CLEAR_IDLEFLAG(&huart4);
 
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart5, UART5_BUFFER, 256);
-
-  __HAL_DMA_DISABLE_IT(&hdma_uart5_rx, DMA_IT_HT);
-
-  init_gyro_filters();
-
-  MahonyAHRSreset();
-
-  reset_yaw_controller();
+  pkt_rx_init(&rx_pkt);
 
   nrf24l01p_rx_init(2500, _250kbps);
 
@@ -1315,10 +1105,7 @@ int main(void)
   PCA9685_SetServoAngle(1, 0.0f);
   set_servo_angle_tim5(servo_angle_deg);
 
-  icm20948_init();
-
-  HAL_Delay(500);
-
+  HAL_Delay(50);
 
 
   /* USER CODE END 2 */
@@ -1414,148 +1201,12 @@ void SystemClock_Config(void)
 // 1. Прерывание от датчика (Data Ready)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    if(GPIO_Pin == icm20948_INT_Pin) icm20948_read_imu_dma_start(imu_dma_tx, imu_dma_rx);
-
     if(GPIO_Pin == NRF24L01_INT_Pin) flag_nrf24l01 = 1;
-}
-
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t size)
-{
-    if (huart->Instance == UART4)
-    {
-        // Команда смены режима: 'M','O','D','E', mode_byte
-        if (UART4_BUFFER[0] == 'M' && UART4_BUFFER[1] == 'O' && UART4_BUFFER[2] == 'D' && UART4_BUFFER[3] == 'E')
-        {
-            ctrl_mode_t requested_mode = (UART4_BUFFER[4] == 1) ? CTRL_MODE_MPPI : CTRL_MODE_MANUAL;
-
-            if (requested_mode != current_mode)
-            {
-                current_mode = requested_mode;
-                send_mode_ack(current_mode);
-                reset_controllers();
-            }
-            else
-            {
-                // Режим не изменился, но подтверждаем, что живём в этом режиме
-                send_mode_ack(current_mode);
-            }
-        }
-        // Данные ручного режима: 'P','C','A' + struct PCA9685
-        else if (UART4_BUFFER[0] == 'P' && UART4_BUFFER[1] == 'C' && UART4_BUFFER[2] == 'A')
-        {
-            if (current_mode == CTRL_MODE_MANUAL)
-            {
-                uint8_t ee = 3;
-                uint8_t* p = (uint8_t*)(void*)&pca9685;
-                for (int count = sizeof(pca9685); count; --count) *p++ = UART4_BUFFER[ee++];
-
-                flag_pca9685 = 1;
-
-                // Heartbeat
-                last_rx_time = HAL_GetTick();
-                heartbeat_fail_counter = 0;
-                connection_lost = 0;
-            }
-            else
-            {
-                // Пришли данные не того режима — отправляем текущий режим
-                send_mode_ack(current_mode);
-            }
-        }
-        // Данные MPPI режима: 'M','P','I' + struct MPPI_Ctrl
-        else if (UART4_BUFFER[0] == 'M' && UART4_BUFFER[1] == 'P' && UART4_BUFFER[2] == 'I')
-        {
-            if (current_mode == CTRL_MODE_MPPI)
-            {
-                uint8_t ee = 3;
-                uint8_t* p = (uint8_t*)(void*)&mppi_ctrl;
-                for (int count = sizeof(mppi_ctrl); count; --count) *p++ = UART4_BUFFER[ee++];
-
-                flag_pca9685 = 1;
-
-                // Heartbeat
-                last_rx_time = HAL_GetTick();
-                heartbeat_fail_counter = 0;
-                connection_lost = 0;
-            }
-            else
-            {
-                // Пришли данные не того режима — отправляем текущий режим
-                send_mode_ack(current_mode);
-            }
-        }
-
-        HAL_UARTEx_ReceiveToIdle_DMA(&huart4, UART4_BUFFER, 256);
-        __HAL_DMA_DISABLE_IT(&hdma_uart4_rx, DMA_IT_HT);
-    }
-
-    if (huart->Instance == UART5)
-    {
-        HAL_UART_Transmit_IT(&huart4, UART5_BUFFER, size);
-        HAL_UARTEx_ReceiveToIdle_DMA(&huart5, UART5_BUFFER, 256);
-        __HAL_DMA_DISABLE_IT(&hdma_uart5_rx, DMA_IT_HT);
-    }
-}
-
-void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
-{
-    if (hspi == &hspi3) {
-
-    	if (icm20948_parse_dma(imu_dma_rx, &gyro, &accel)) {
-
-        Now = htim2.Instance->CNT;
-        deltaT = ((Now - lastUpdate_icm20948)/1000000.0f); // set integration time by time elapsed since last filter update
-        lastUpdate_icm20948 = Now;
-
-        sum += deltaT; // sum for averaging filter update rate
-        sumcount++;
-
-        float gx,gy,gz;
-
-        arm_biquad_cascade_df1_f32(&S_gyroX, &gyro.x, &gx, 1);
-        arm_biquad_cascade_df1_f32(&S_gyroY, &gyro.y, &gy, 1);
-        arm_biquad_cascade_df1_f32(&S_gyroZ, &gyro.z, &gz, 1);
-
-        gx_filt = GYRO_CUTOFF_FREQ * gx + (1.0f - GYRO_CUTOFF_FREQ) * gx_filt;
-        gy_filt = GYRO_CUTOFF_FREQ * gy + (1.0f - GYRO_CUTOFF_FREQ) * gy_filt;
-        gz_filt = GYRO_CUTOFF_FREQ * gz + (1.0f - GYRO_CUTOFF_FREQ) * gz_filt;
-
-        // 3. Проверка вектора гравитации (по СЫРЫМ данным)
-        float accel_magnitude = sqrtf(accel.x * accel.x + accel.y * accel.y + accel.z * accel.z);
-        bool use_accel = (accel_magnitude > 0.9f) && (accel_magnitude < 1.1f); // 0.9^2 и 1.1^2
-
-        // 5. Подготовка данных для Mahony
-        if (use_accel) {
-
-        	float ax = process_median5(accel.x, accX_buffer);
-        	float ay = process_median5(accel.y, accY_buffer);
-        	float az = process_median5(accel.z, accZ_buffer);
-
-        	ax_filt = ACCEL_CUTOFF_FREQ * ax + (1.0f - ACCEL_CUTOFF_FREQ) * ax_filt;
-        	ay_filt = ACCEL_CUTOFF_FREQ * ay + (1.0f - ACCEL_CUTOFF_FREQ) * ay_filt;
-        	az_filt = ACCEL_CUTOFF_FREQ * az + (1.0f - ACCEL_CUTOFF_FREQ) * az_filt;
-
-        	accel_Mahony.x = ax_filt;
-			accel_Mahony.y = ay_filt;
-			accel_Mahony.z = az_filt;
-
-        }
-        else {
-
-        	accel_Mahony.x = 0.0f;
-        	accel_Mahony.y = 0.0f;
-        	accel_Mahony.z = 0.0f;
-        }
-        }
-
-    }
-
 }
 
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
 
-	ST7735_IT_Callback(hspi); // Наша старая добрая функция очистки флага
-
+	ST7735_IT_Callback(hspi);
 }
 
 
@@ -1563,7 +1214,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
 	// measure velocity, position
 	if(htim == &htim4) update_encoder();
-    if(htim == &htim1) update_lidar_gprmc();
 }
 /* USER CODE END 4 */
 

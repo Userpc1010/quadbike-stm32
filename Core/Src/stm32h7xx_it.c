@@ -56,15 +56,9 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-extern DMA_HandleTypeDef hdma_spi3_rx;
-extern DMA_HandleTypeDef hdma_spi3_tx;
-extern SPI_HandleTypeDef hspi3;
 extern SPI_HandleTypeDef hspi4;
 extern TIM_HandleTypeDef htim1;
 extern TIM_HandleTypeDef htim4;
-extern DMA_HandleTypeDef hdma_uart4_rx;
-extern DMA_HandleTypeDef hdma_uart5_rx;
-extern DMA_HandleTypeDef hdma_usart2_tx;
 extern UART_HandleTypeDef huart4;
 extern UART_HandleTypeDef huart5;
 /* USER CODE BEGIN EV */
@@ -227,90 +221,6 @@ void EXTI0_IRQHandler(void)
 }
 
 /**
-  * @brief This function handles EXTI line1 interrupt.
-  */
-void EXTI1_IRQHandler(void)
-{
-  /* USER CODE BEGIN EXTI1_IRQn 0 */
-
-  /* USER CODE END EXTI1_IRQn 0 */
-  HAL_GPIO_EXTI_IRQHandler(icm20948_INT_Pin);
-  /* USER CODE BEGIN EXTI1_IRQn 1 */
-
-  /* USER CODE END EXTI1_IRQn 1 */
-}
-
-/**
-  * @brief This function handles DMA1 stream0 global interrupt.
-  */
-void DMA1_Stream0_IRQHandler(void)
-{
-  /* USER CODE BEGIN DMA1_Stream0_IRQn 0 */
-
-  /* USER CODE END DMA1_Stream0_IRQn 0 */
-  HAL_DMA_IRQHandler(&hdma_uart4_rx);
-  /* USER CODE BEGIN DMA1_Stream0_IRQn 1 */
-
-  /* USER CODE END DMA1_Stream0_IRQn 1 */
-}
-
-/**
-  * @brief This function handles DMA1 stream1 global interrupt.
-  */
-void DMA1_Stream1_IRQHandler(void)
-{
-  /* USER CODE BEGIN DMA1_Stream1_IRQn 0 */
-
-  /* USER CODE END DMA1_Stream1_IRQn 0 */
-  HAL_DMA_IRQHandler(&hdma_uart5_rx);
-  /* USER CODE BEGIN DMA1_Stream1_IRQn 1 */
-
-  /* USER CODE END DMA1_Stream1_IRQn 1 */
-}
-
-/**
-  * @brief This function handles DMA1 stream2 global interrupt.
-  */
-void DMA1_Stream2_IRQHandler(void)
-{
-  /* USER CODE BEGIN DMA1_Stream2_IRQn 0 */
-
-  /* USER CODE END DMA1_Stream2_IRQn 0 */
-  HAL_DMA_IRQHandler(&hdma_spi3_rx);
-  /* USER CODE BEGIN DMA1_Stream2_IRQn 1 */
-
-  /* USER CODE END DMA1_Stream2_IRQn 1 */
-}
-
-/**
-  * @brief This function handles DMA1 stream3 global interrupt.
-  */
-void DMA1_Stream3_IRQHandler(void)
-{
-  /* USER CODE BEGIN DMA1_Stream3_IRQn 0 */
-
-  /* USER CODE END DMA1_Stream3_IRQn 0 */
-  HAL_DMA_IRQHandler(&hdma_spi3_tx);
-  /* USER CODE BEGIN DMA1_Stream3_IRQn 1 */
-
-  /* USER CODE END DMA1_Stream3_IRQn 1 */
-}
-
-/**
-  * @brief This function handles DMA1 stream4 global interrupt.
-  */
-void DMA1_Stream4_IRQHandler(void)
-{
-  /* USER CODE BEGIN DMA1_Stream4_IRQn 0 */
-
-  /* USER CODE END DMA1_Stream4_IRQn 0 */
-  HAL_DMA_IRQHandler(&hdma_usart2_tx);
-  /* USER CODE BEGIN DMA1_Stream4_IRQn 1 */
-
-  /* USER CODE END DMA1_Stream4_IRQn 1 */
-}
-
-/**
   * @brief This function handles TIM1 update interrupt.
   */
 void TIM1_UP_IRQHandler(void)
@@ -339,31 +249,81 @@ void TIM4_IRQHandler(void)
 }
 
 /**
-  * @brief This function handles SPI3 global interrupt.
-  */
-void SPI3_IRQHandler(void)
-{
-  /* USER CODE BEGIN SPI3_IRQn 0 */
-
-  /* USER CODE END SPI3_IRQn 0 */
-  HAL_SPI_IRQHandler(&hspi3);
-  /* USER CODE BEGIN SPI3_IRQn 1 */
-
-  /* USER CODE END SPI3_IRQn 1 */
-}
-
-/**
   * @brief This function handles UART4 global interrupt.
   */
 void UART4_IRQHandler(void)
 {
   /* USER CODE BEGIN UART4_IRQn 0 */
 
-  /* USER CODE END UART4_IRQn 0 */
-  HAL_UART_IRQHandler(&huart4);
-  /* USER CODE BEGIN UART4_IRQn 1 */
+	// RXNE — пришёл байт
+	    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_RXNE)) {
+	        uint8_t b = (uint8_t)(UART4->RDR & 0xFF);
+	        if (uart4_rx_idx < UART4_RX_BUF_SIZE) {
+	            uart4_rx_buf[uart4_rx_active][uart4_rx_idx++] = b;
+	            uart4_total_bytes++;
+	        }
+	    }
 
-  /* USER CODE END UART4_IRQn 1 */
+	    // IDLE — конец пакета
+	    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_IDLE)) {
+	        __HAL_UART_CLEAR_IDLEFLAG(&huart4);
+	        if (uart4_rx_idx > 0) {
+	            uint8_t next_head = (uart4_pkt_head + 1) % UART4_PKT_QUEUE_SIZE;
+	            if (next_head != uart4_pkt_tail) {
+	                // место есть — копируем в очередь
+	                for (uint16_t i = 0; i < uart4_rx_idx; i++) {
+	                    uart4_pkt_queue[uart4_pkt_head][i] = uart4_rx_buf[uart4_rx_active][i];
+	                }
+	                uart4_pkt_len_queue[uart4_pkt_head] = uart4_rx_idx;
+	                uart4_pkt_head = next_head;
+	                uart4_total_packets++;
+	            } else {
+	                // очередь полна — реальная потеря
+	                uart4_pkt_dropped++;
+	            }
+	            uart4_rx_active ^= 1;
+	            uart4_rx_idx = 0;
+	        }
+	    }
+
+	    // ORE/FE/NE — сброс
+	    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_ORE)) {
+	        __HAL_UART_CLEAR_OREFLAG(&huart4);
+	    }
+	    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_FE)) {
+	        __HAL_UART_CLEAR_FEFLAG(&huart4);
+	    }
+	    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_NE)) {
+	        __HAL_UART_CLEAR_NEFLAG(&huart4);
+	    }
+
+	    // TXE — отдать байт
+	    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_TXE) &&
+	        __HAL_UART_GET_IT_SOURCE(&huart4, UART_IT_TXE))
+	    {
+	        if (uart4_tx_tail != uart4_tx_head) {
+	            UART4->TDR = uart4_tx_buf[uart4_tx_tail];
+	            uart4_tx_tail = (uart4_tx_tail + 1) % UART4_TX_BUF_SIZE;
+	        } else {
+	            __HAL_UART_DISABLE_IT(&huart4, UART_IT_TXE);
+	            __HAL_UART_ENABLE_IT(&huart4, UART_IT_TC);
+	        }
+	    }
+
+	    // TC — завершение
+	    if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_TC) &&
+	        __HAL_UART_GET_IT_SOURCE(&huart4, UART_IT_TC))
+	    {
+	        __HAL_UART_CLEAR_FLAG(&huart4, UART_FLAG_TC);
+	        __HAL_UART_DISABLE_IT(&huart4, UART_IT_TC);
+	        uart4_tx_busy = 0;
+	        if (uart4_tx_tail != uart4_tx_head) {
+	            uart4_tx_busy = 1;
+	            __HAL_UART_ENABLE_IT(&huart4, UART_IT_TXE);
+	        }
+	    }
+
+  /* USER CODE END UART4_IRQn 0 */
 }
 
 /**

@@ -36,8 +36,9 @@ extern "C" {
 #include "../../ST7735/st7735.h"
 #include "../../nRF24L01p/nrf24l01p.h"
 #include "../../pca9685/pca9685.h"
-#include "../../ICM20948/icm20948.h"
 #include "../../DSP/Include/arm_math.h"
+#include "protocol.h"
+#include "uart4_link.h"
 
 /* USER CODE END Includes */
 
@@ -78,8 +79,6 @@ void Error_Handler(void);
 #define miniPC_UART4A1_GPIO_Port GPIOA
 #define Stering_PWM_Out_Pin GPIO_PIN_2
 #define Stering_PWM_Out_GPIO_Port GPIOA
-#define No_Use_Pin GPIO_PIN_3
-#define No_Use_GPIO_Port GPIOA
 #define Encoder_A_Pin GPIO_PIN_6
 #define Encoder_A_GPIO_Port GPIOA
 #define Encoder_B_Pin GPIO_PIN_7
@@ -110,19 +109,6 @@ void Error_Handler(void);
 #define NRF24L01_SCK_GPIO_Port GPIOA
 #define Camera_Source_input_Pin GPIO_PIN_12
 #define Camera_Source_input_GPIO_Port GPIOA
-#define icm20948_CE_Pin GPIO_PIN_15
-#define icm20948_CE_GPIO_Port GPIOA
-#define icm20948_SCK_Pin GPIO_PIN_10
-#define icm20948_SCK_GPIO_Port GPIOC
-#define icm20948_MISO_Pin GPIO_PIN_11
-#define icm20948_MISO_GPIO_Port GPIOC
-#define icm20948_MOSI_Pin GPIO_PIN_12
-#define icm20948_MOSI_GPIO_Port GPIOC
-#define icm20948_INT_Pin GPIO_PIN_1
-#define icm20948_INT_GPIO_Port GPIOD
-#define icm20948_INT_EXTI_IRQn EXTI1_IRQn
-#define Lidar_GPRMC_Transmit_Pin GPIO_PIN_5
-#define Lidar_GPRMC_Transmit_GPIO_Port GPIOD
 #define W25Q64_EEPROM_CE_Pin GPIO_PIN_6
 #define W25Q64_EEPROM_CE_GPIO_Port GPIOD
 #define W25Q64_EEPROM_Pin GPIO_PIN_7
